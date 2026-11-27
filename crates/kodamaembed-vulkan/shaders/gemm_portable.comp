@@ -1,0 +1,64 @@
+#version 460
+// For GPUs without cooperative matrices: FP32 fused multiply-adds, K in order.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(constant_id = 0) const uint EPILOGUE = 0;
+layout(constant_id = 1) const uint LOW_COLUMNS = 0;
+
+layout(std430, binding = 0) readonly buffer A { f16vec4 a[]; };
+layout(std430, binding = 1) readonly buffer W { f16vec4 w[]; };
+#include "epilogue.glsl"
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+const uint BM = 64, BN = 64, BK = 16;
+
+// Stored transposed ([k][row]) so the inner loop reads consecutive words.
+shared float a_tile[BK][BM];
+shared float w_tile[BK][BN];
+
+void main() {
+    const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+    const uint tx = gl_LocalInvocationID.x, ty = gl_LocalInvocationID.y;
+    const uint thread = ty * 16 + tx;
+    const uint row_vectors = p.K / 4;
+    float acc[4][4];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 4; ++j) acc[i][j] = 0.0;
+
+    for (uint k0 = 0; k0 < p.K; k0 += BK) {
+        // 64 rows x 16 halfs = 256 vectors of four: one per invocation.
+        const uint row = thread / 4, part = thread % 4;
+        const uint source = m0 + row;
+        const vec4 va = source < p.M ? vec4(a[source * row_vectors + k0 / 4 + part]) : vec4(0.0);
+        const vec4 vw = vec4(w[(n0 + row) * row_vectors + k0 / 4 + part]);
+        for (uint q = 0; q < 4; ++q) {
+            a_tile[part * 4 + q][row] = va[q];
+            w_tile[part * 4 + q][row] = vw[q];
+        }
+        barrier();
+        for (uint kk = 0; kk < BK; ++kk) {
+            vec4 x, y;
+            for (uint i = 0; i < 4; ++i) {
+                x[i] = a_tile[kk][ty * 4 + i];
+                y[i] = w_tile[kk][tx * 4 + i];
+            }
+            for (uint i = 0; i < 4; ++i)
+                for (uint j = 0; j < 4; ++j) acc[i][j] = fma(x[i], y[j], acc[i][j]);
+        }
+        barrier();
+    }
+
+    for (uint i = 0; i < 4; ++i) {
+        const uint row = m0 + ty * 4 + i;
+        if (row >= p.M) continue;
+        for (uint j = 0; j < 4; ++j) WRITE(row, n0 + tx * 4 + j, p.N, acc[i][j], acc[i][j ^ 1u]);
+    }
+}

@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.spv binary
+*.pdf binary
+*.png binary
+*.ico binary
+/crates/kodamaembed-cpu/src/int8/e5_v1_signs.bin binary

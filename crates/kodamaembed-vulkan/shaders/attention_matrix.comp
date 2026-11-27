@@ -1,0 +1,309 @@
+#version 460
+// Scores add 2^-11 (q_low . k_high + q_high . k_low) to q_high . k_high, keeping Q and K's FP32
+// precision; P rounds to FP16 as p * 2^8 so weights down to 2^-22 stay normal.
+
+// Matrices are named variables, never arrays, which NVIDIA's driver keeps in memory; shared
+// arrays are globals, never parameters, which GLSL copies back out.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 128) in;
+layout(constant_id = 0) const uint D = 64;
+layout(constant_id = 1) const uint HEADS = 16;
+
+#include "half.glsl"
+
+const uint WIDTH = HEADS * D, ROW4 = 3 * WIDTH / 4, LOW_ROW4 = 2 * WIDTH / 4, D4 = D / 4;
+const uint BLOCK = 64, T = 16;
+// Tile rows in f16vec4: D / 4 of data and 2 of padding against bank conflicts.
+const uint PITCH = D4 + 2, TILE = BLOCK * PITCH;
+// In uvec4: 16 x 64 FP32 scores; the row factors follow 16 x 64 FP16 weights.
+const uint STAGE = T * BLOCK / 4, FACTORS = T * BLOCK / 8;
+const float LOW_WEIGHT = 1.0 / 2048.0, LOW_SCALE = 2048.0, P_SHIFT = 8.0;
+const float LOG2E = 1.4426950408889634;
+
+layout(std430, binding = 0) readonly buffer QKV { f16vec4 qkv[]; };
+layout(std430, binding = 1) readonly buffer Low { vec4 low[]; };
+layout(std430, binding = 2) readonly buffer Cu { int cu[]; };
+layout(std430, binding = 3) writeonly buffer Out { f16vec4 result[]; };
+#ifdef RELATIVE_BIAS
+// MPNet's relative-position bias, [head][key - query + longest - 1].
+layout(std430, binding = 4) readonly buffer Bias { float bias[]; };
+#endif
+
+layout(push_constant) uniform Push {
+    float scale;
+#ifdef RELATIVE_BIAS
+    uint longest;
+#endif
+#ifdef LOCAL
+    // A query row sees the keys within this many rows of it.
+    uint reach;
+#endif
+} p;
+
+// The end of the keys a workgroup's rows read, and the keys of a block that a row sees: the
+// sequence, or with LOCAL the last key block its windows reach and the keys inside the row's own.
+#ifdef LOCAL
+#define KEYS_END keys_end
+#define SEEN(key) (key < keys && abs(int(k0 + key) - int(q0 + group * T + row)) <= int(p.reach))
+#else
+#define KEYS_END len
+#define SEEN(key) (key < keys)
+#endif
+
+// Q high and low pass through the K tiles first, reusing their shared memory.
+shared f16vec4 k_high[TILE];
+shared f16vec4 k_low[TILE];
+shared f16vec4 v_tile[TILE];
+// Per subgroup: scores (FP32), then P (FP16), then P * V (FP32).
+shared uvec4 stage[4 * STAGE];
+
+#define ACCUMULATOR coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>
+#define HALF_ACCUMULATOR coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>
+#define MATRIX_A coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA>
+#define MATRIX_B coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB>
+
+const uint SHARE = BLOCK * D4 / 128;
+
+void fetch_split(uint first, uint rows, uint offset, out f16vec4 high[SHARE], out vec4 lo[SHARE]) {
+    [[unroll]] for (uint n = 0; n < SHARE; ++n) {
+        const uint i = gl_LocalInvocationID.x + n * 128, row = i / D4;
+        if (row < rows) {
+            high[n] = qkv[(first + row) * ROW4 + offset + i % D4];
+            lo[n] = low[(first + row) * LOW_ROW4 + offset + i % D4];
+        } else {
+            high[n] = f16vec4(0.0);
+            lo[n] = vec4(0.0);
+        }
+    }
+}
+
+void fetch_values(uint first, uint rows, uint offset, out f16vec4 values[SHARE]) {
+    [[unroll]] for (uint n = 0; n < SHARE; ++n) {
+        const uint i = gl_LocalInvocationID.x + n * 128, row = i / D4;
+        values[n] = row < rows ? qkv[(first + row) * ROW4 + offset + i % D4] : f16vec4(0.0);
+    }
+}
+
+// Low parts scale by 2^11 into FP16's normal range.
+void store_split(f16vec4 high[SHARE], vec4 lo[SHARE]) {
+    [[unroll]] for (uint n = 0; n < SHARE; ++n) {
+        const uint i = gl_LocalInvocationID.x + n * 128, at = (i / D4) * PITCH + i % D4;
+        k_high[at] = high[n];
+        k_low[at] = f16vec4(lo[n] * LOW_SCALE);
+    }
+}
+
+void store_values(f16vec4 values[SHARE]) {
+    [[unroll]] for (uint n = 0; n < SHARE; ++n) {
+        const uint i = gl_LocalInvocationID.x + n * 128;
+        v_tile[(i / D4) * PITCH + i % D4] = values[n];
+    }
+}
+
+#define SCORE_SLICE(s, c, j, t, qh, ql)                                                    \
+    {                                                                                      \
+        MATRIX_B kh, kl;                                                                   \
+        coopMatLoad(kh, k_high, (j * T) * PITCH + t * 4, PITCH,                            \
+                    gl_CooperativeMatrixLayoutColumnMajor);                                \
+        coopMatLoad(kl, k_low, (j * T) * PITCH + t * 4, PITCH,                             \
+                    gl_CooperativeMatrixLayoutColumnMajor);                                \
+        s = coopMatMulAdd(qh, kh, s);                                                      \
+        c = coopMatMulAdd(ql, kh, c);                                                      \
+        c = coopMatMulAdd(qh, kl, c);                                                      \
+    }
+
+#define SCORE(j)                                                                           \
+    {                                                                                      \
+        ACCUMULATOR s = ACCUMULATOR(0.0);                                                  \
+        HALF_ACCUMULATOR c = HALF_ACCUMULATOR(0.0);                                        \
+        SCORE_SLICE(s, c, j, 0, qh0, ql0);                                                 \
+        SCORE_SLICE(s, c, j, 1, qh1, ql1);                                                 \
+        if (D > 32) {                                                                      \
+            SCORE_SLICE(s, c, j, 2, qh2, ql2);                                             \
+            SCORE_SLICE(s, c, j, 3, qh3, ql3);                                             \
+        }                                                                                  \
+        s = (s + ACCUMULATOR(c) * LOW_WEIGHT) * scale_log2e;                               \
+        coopMatStore(s, stage, base + j * (T / 4), BLOCK / 4,                              \
+                     gl_CooperativeMatrixLayoutRowMajor);                                  \
+    }
+
+#define PV(o, dt)                                                                          \
+    {                                                                                      \
+        MATRIX_B v;                                                                        \
+        coopMatLoad(v, v_tile, 0 * T * PITCH + dt * 4, PITCH, gl_CooperativeMatrixLayoutRowMajor); \
+        o = coopMatMulAdd(p0, v, o);                                                       \
+        coopMatLoad(v, v_tile, 1 * T * PITCH + dt * 4, PITCH, gl_CooperativeMatrixLayoutRowMajor); \
+        o = coopMatMulAdd(p1, v, o);                                                       \
+        coopMatLoad(v, v_tile, 2 * T * PITCH + dt * 4, PITCH, gl_CooperativeMatrixLayoutRowMajor); \
+        o = coopMatMulAdd(p2, v, o);                                                       \
+        coopMatLoad(v, v_tile, 3 * T * PITCH + dt * 4, PITCH, gl_CooperativeMatrixLayoutRowMajor); \
+        o = coopMatMulAdd(p3, v, o);                                                       \
+    }
+
+void main() {
+    const uint sequence = gl_WorkGroupID.z, head = gl_WorkGroupID.y;
+    const uint start = uint(cu[sequence]), len = uint(cu[sequence + 1]) - start;
+    const uint q0 = gl_WorkGroupID.x * BLOCK;
+    if (q0 >= len) return;
+    const uint group = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    const uint base = group * STAGE;
+    const float scale_log2e = p.scale * LOG2E;
+    // Two invocations per query row: `side` picks keys and output columns.
+    const uint row = lane >> 1, side = lane & 1u;
+#ifdef RELATIVE_BIAS
+    // Clamped rows and keys read inside the table, whatever a compiler hoists.
+    const uint relative =
+        head * (2 * p.longest - 1) + p.longest - 1 - min(q0 + group * T + row, len - 1);
+#endif
+
+    f16vec4 high[SHARE], values[SHARE];
+    vec4 lo[SHARE];
+    fetch_split(start + q0, min(BLOCK, len - q0), head * D4, high, lo);
+    store_split(high, lo);
+    barrier();
+    MATRIX_A qh0, qh1, qh2, qh3, ql0, ql1, ql2, ql3;
+    const uint q_at = (group * T) * PITCH;
+    coopMatLoad(qh0, k_high, q_at, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(qh1, k_high, q_at + 4, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(ql0, k_low, q_at, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(ql1, k_low, q_at + 4, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+    if (D > 32) {
+        coopMatLoad(qh2, k_high, q_at + 8, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(qh3, k_high, q_at + 12, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ql2, k_low, q_at + 8, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(ql3, k_low, q_at + 12, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+    }
+
+    ACCUMULATOR o0 = ACCUMULATOR(0.0), o1 = ACCUMULATOR(0.0);
+    ACCUMULATOR o2 = ACCUMULATOR(0.0), o3 = ACCUMULATOR(0.0);
+    float row_max = -1.0 / 0.0, row_sum = 0.0;
+
+    // Each key block is fetched into registers while the previous one is in use.
+#ifdef LOCAL
+    const uint first_key = (max(q0, p.reach) - p.reach) / BLOCK * BLOCK;
+    const uint keys_end = min(len, q0 + BLOCK + p.reach);
+    fetch_split(start + first_key, min(BLOCK, keys_end - first_key), WIDTH / 4 + head * D4, high, lo);
+    fetch_values(start + first_key, min(BLOCK, keys_end - first_key), 2 * WIDTH / 4 + head * D4,
+                 values);
+    for (uint k0 = first_key; k0 < keys_end; k0 += BLOCK) {
+#else
+    fetch_split(start, min(BLOCK, len), WIDTH / 4 + head * D4, high, lo);
+    fetch_values(start, min(BLOCK, len), 2 * WIDTH / 4 + head * D4, values);
+    for (uint k0 = 0; k0 < len; k0 += BLOCK) {
+#endif
+        const uint keys = min(BLOCK, KEYS_END - k0);
+        barrier();
+        store_split(high, lo);
+        store_values(values);
+        barrier();
+        const uint next = k0 + BLOCK;
+        if (next < KEYS_END) {
+            fetch_split(start + next, min(BLOCK, KEYS_END - next), WIDTH / 4 + head * D4, high, lo);
+            fetch_values(start + next, min(BLOCK, KEYS_END - next), 2 * WIDTH / 4 + head * D4, values);
+        }
+
+        SCORE(0);
+        SCORE(1);
+        SCORE(2);
+        SCORE(3);
+        subgroupBarrier();
+
+        // This invocation's 32 keys of its row; keys past the sequence end weigh 0.
+        float s[32];
+        float block_max = -1.0 / 0.0;
+        [[unroll]] for (uint i = 0; i < 8; ++i) {
+            const vec4 four = uintBitsToFloat(stage[base + row * (BLOCK / 4) + side * 8 + i]);
+            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                const uint key = side * 32 + i * 4 + e;
+#ifdef RELATIVE_BIAS
+                const float term = bias[relative + min(k0 + key, len - 1)] * LOG2E;
+                s[i * 4 + e] = key < keys ? four[e] + term : -1.0 / 0.0;
+#else
+                s[i * 4 + e] = SEEN(key) ? four[e] : -1.0 / 0.0;
+#endif
+                block_max = max(block_max, s[i * 4 + e]);
+            }
+        }
+        block_max = max(block_max, subgroupShuffleXor(block_max, 1));
+        const float next_max = max(row_max, block_max);
+#ifdef LOCAL
+        // A row whose window starts past this block has seen no key: -inf less -inf is no scale,
+        // and a finite shift keeps its weights at zero.
+        const float rescale = next_max == -1.0 / 0.0 ? 1.0 : exp2(row_max - next_max);
+        row_max = next_max;
+        row_sum *= rescale;
+        subgroupBarrier();
+
+        const float shifted = row_max == -1.0 / 0.0 ? 0.0 : row_max - P_SHIFT;
+#else
+        const float rescale = exp2(row_max - next_max);
+        row_max = next_max;
+        row_sum *= rescale;
+        subgroupBarrier();
+
+        const float shifted = row_max - P_SHIFT;
+#endif
+        [[unroll]] for (uint i = 0; i < 4; ++i) {
+            uvec4 packed;
+            [[unroll]] for (uint e = 0; e < 4; ++e) {
+                const uint k = i * 8 + e * 2;
+                const float p0 = round_to_half(exp2(s[k] - shifted));
+                const float p1 = round_to_half(exp2(s[k + 1] - shifted));
+                row_sum += p0 + p1;
+                packed[e] = packHalf2x16(vec2(p0, p1));
+            }
+            stage[base + row * (BLOCK / 8) + side * 4 + i] = packed;
+        }
+        // Matrices cannot scale rows, so a staged tile of row factors multiplies in.
+        const uvec4 factor = uvec4(floatBitsToUint(rescale));
+        stage[base + FACTORS + row * (T / 4) + side * 2] = factor;
+        stage[base + FACTORS + row * (T / 4) + side * 2 + 1] = factor;
+        subgroupBarrier();
+
+        MATRIX_A p0, p1, p2, p3;
+        coopMatLoad(p0, stage, base, BLOCK / 8, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(p1, stage, base + 2, BLOCK / 8, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(p2, stage, base + 4, BLOCK / 8, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(p3, stage, base + 6, BLOCK / 8, gl_CooperativeMatrixLayoutRowMajor);
+        ACCUMULATOR factors;
+        coopMatLoad(factors, stage, base + FACTORS, T / 4, gl_CooperativeMatrixLayoutRowMajor);
+        o0 = o0 * factors;
+        o1 = o1 * factors;
+        if (D > 32) {
+            o2 = o2 * factors;
+            o3 = o3 * factors;
+        }
+        PV(o0, 0);
+        PV(o1, 1);
+        if (D > 32) {
+            PV(o2, 2);
+            PV(o3, 3);
+        }
+    }
+
+    subgroupBarrier();
+    coopMatStore(o0, stage, base, D4, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(o1, stage, base + T / 4, D4, gl_CooperativeMatrixLayoutRowMajor);
+    if (D > 32) {
+        coopMatStore(o2, stage, base + 2 * T / 4, D4, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatStore(o3, stage, base + 3 * T / 4, D4, gl_CooperativeMatrixLayoutRowMajor);
+    }
+    subgroupBarrier();
+    const float inverse = 1.0 / (row_sum + subgroupShuffleXor(row_sum, 1));
+    const uint query = q0 + group * T + row;
+    if (query < len) {
+        [[unroll]] for (uint i = 0; i < D / 8; ++i) {
+            const vec4 four = uintBitsToFloat(stage[base + row * D4 + side * (D / 8) + i]);
+            result[(start + query) * (WIDTH / 4) + head * D4 + side * (D / 8) + i] =
+                f16vec4(four * inverse);
+        }
+    }
+}

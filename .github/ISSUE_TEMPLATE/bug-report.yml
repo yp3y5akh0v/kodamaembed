@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work as documented.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The shortest code or command that shows the problem.
+      render: python
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: "`kodamaembed --version`"
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: OS and architecture
+      placeholder: Ubuntu 24.04 x86_64
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+  - type: input
+    id: device
+    attributes:
+      label: "`model.device`, and the driver if a GPU is involved"
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: shell

@@ -1,0 +1,6 @@
+# Timing environment for bench_ort_query.py. TensorRT also needs its compatible CUDA runtime.
+numpy==2.5.3
+onnx==1.23.1
+onnxruntime-gpu[cuda,cudnn]==1.30.0
+tensorrt-cu12-libs==10.16.1.11
+tokenizers==0.23.2

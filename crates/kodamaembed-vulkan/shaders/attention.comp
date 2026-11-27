@@ -1,0 +1,131 @@
+#version 460
+// Packed attention, one invocation a query row, online softmax. `low` holds
+// what rounding Q and K to FP16 lost, so scores keep their FP32 precision.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_control_flow_attributes : require
+
+layout(local_size_x = 64) in;
+
+layout(constant_id = 0) const uint D = 64;
+layout(constant_id = 1) const uint HEADS = 16;
+
+const uint PARTS = D / 4, WIDTH = HEADS * D, ROW = 3 * WIDTH / 4, LOW_ROW = 2 * WIDTH / 4;
+const uint KEYS = 32;
+
+layout(std430, binding = 0) readonly buffer QKV { f16vec4 qkv[]; };
+layout(std430, binding = 1) readonly buffer Low { vec4 low[]; };
+layout(std430, binding = 2) readonly buffer Cu { int cu[]; };
+layout(std430, binding = 3) writeonly buffer Out { f16vec4 result[]; };
+#ifdef RELATIVE_BIAS
+// MPNet's relative-position bias, [head][key - query + longest - 1].
+layout(std430, binding = 4) readonly buffer Bias { float bias[]; };
+#endif
+
+layout(push_constant) uniform Push {
+    float scale;
+#ifdef RELATIVE_BIAS
+    uint longest;
+#endif
+#ifdef LOCAL
+    // A query row sees the keys within this many rows of it.
+    uint reach;
+#endif
+} p;
+
+shared vec4 k_tile[KEYS][PARTS];
+shared vec4 v_tile[KEYS][PARTS];
+
+// The keys a workgroup's rows read, and the ones of a block that a row sees: the sequence, or
+// with LOCAL the key blocks its windows reach and the keys inside the row's own.
+#ifdef LOCAL
+#define FIRST_KEY first_key
+#define KEYS_END keys_end
+#define SEEN(key) (key < count && abs(int(k0 + key) - int(query)) <= int(p.reach))
+#else
+#define FIRST_KEY 0
+#define KEYS_END len
+#define SEEN(key) (key < count)
+#endif
+
+void main() {
+    const uint sequence = gl_WorkGroupID.z, head = gl_WorkGroupID.y;
+    const uint start = uint(cu[sequence]), len = uint(cu[sequence + 1]) - start;
+    const uint first_query = gl_WorkGroupID.x * 64;
+    if (first_query >= len) return;
+    const uint query = first_query + gl_LocalInvocationID.x;
+    const bool in_sequence = query < len;
+
+    // Every loop over parts and keys runs to a constant bound, fully unrolled,
+    // so q, o and scores live in registers rather than memory.
+    vec4 q[PARTS];
+    vec4 o[PARTS];
+    [[unroll]] for (uint part = 0; part < PARTS; ++part) {
+        q[part] = in_sequence ? vec4(qkv[(start + query) * ROW + head * PARTS + part]) +
+                                    low[(start + query) * LOW_ROW + head * PARTS + part]
+                              : vec4(0.0);
+        o[part] = vec4(0.0);
+    }
+    float row_max = -1.0 / 0.0;
+    float row_sum = 0.0;
+#ifdef RELATIVE_BIAS
+    // Clamped rows and keys read inside the table, whatever a compiler hoists.
+    const uint relative = head * (2 * p.longest - 1) + p.longest - 1 - min(query, len - 1);
+#endif
+#ifdef LOCAL
+    const uint first_key = (max(first_query, p.reach) - p.reach) / KEYS * KEYS;
+    const uint keys_end = min(len, first_query + 64 + p.reach);
+#endif
+
+    for (uint k0 = FIRST_KEY; k0 < KEYS_END; k0 += KEYS) {
+        barrier();
+        for (uint i = gl_LocalInvocationID.x; i < KEYS * PARTS; i += 64) {
+            const uint key = i / PARTS, part = i % PARTS, token = k0 + key;
+            if (token < KEYS_END) {
+                const uint at = (start + token) * ROW + head * PARTS + part;
+                const uint low_at = (start + token) * LOW_ROW + WIDTH / 4 + head * PARTS + part;
+                k_tile[key][part] = vec4(qkv[at + WIDTH / 4]) + low[low_at];
+                v_tile[key][part] = vec4(qkv[at + 2 * WIDTH / 4]);
+            }
+        }
+        barrier();
+        if (!in_sequence) continue;
+        const uint count = min(KEYS, KEYS_END - k0);
+        float scores[KEYS];
+        float block_max = row_max;
+        [[unroll]] for (uint key = 0; key < KEYS; ++key) {
+            if (SEEN(key)) {
+                float s = 0.0;
+                [[unroll]] for (uint part = 0; part < PARTS; ++part)
+                    s += dot(q[part], k_tile[key][part]);
+                scores[key] = s * p.scale;
+#ifdef RELATIVE_BIAS
+                scores[key] += bias[relative + min(k0 + key, len - 1)];
+#endif
+                block_max = max(block_max, scores[key]);
+            }
+        }
+#ifdef LOCAL
+        // A row whose window starts past this block has seen no key: -inf less -inf is no scale.
+        const float rescale = block_max == -1.0 / 0.0 ? 1.0 : exp(row_max - block_max);
+#else
+        const float rescale = exp(row_max - block_max);
+#endif
+        row_sum *= rescale;
+        [[unroll]] for (uint part = 0; part < PARTS; ++part) o[part] *= rescale;
+        [[unroll]] for (uint key = 0; key < KEYS; ++key) {
+            if (SEEN(key)) {
+                const float weight = exp(scores[key] - block_max);
+                row_sum += weight;
+                [[unroll]] for (uint part = 0; part < PARTS; ++part)
+                    o[part] += weight * v_tile[key][part];
+            }
+        }
+        row_max = block_max;
+    }
+    if (in_sequence) {
+        const float inverse = 1.0 / row_sum;
+        [[unroll]] for (uint part = 0; part < PARTS; ++part)
+            result[(start + query) * (WIDTH / 4) + head * PARTS + part] = f16vec4(o[part] * inverse);
+    }
+}

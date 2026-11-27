@@ -1,0 +1,549 @@
+\documentclass[10pt]{article}
+
+\pdfinfoomitdate=1
+\pdftrailerid{}
+\pdfsuppressptexinfo=-1
+
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\hypersetup{pdftitle={The Quantized Mode of KodamaEmbed: Bit-Identical Centered INT8 BERT Embeddings on CPUs and NVIDIA GPUs},
+            pdfauthor={Yuriy Peysakhov}}
+
+\title{The Quantized Mode of KodamaEmbed:\\Bit-Identical Centered INT8 BERT Embeddings\\on CPUs and NVIDIA GPUs}
+\author{Yuriy Peysakhov}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+KodamaEmbed is an open-source Rust engine for BERT and ModernBERT embedding
+and reranking models with CPU, CUDA and Vulkan backends. Its quantized mode,
+centered INT8, specifies one
+numerical contract for the whole encoder: static per-token-class centers,
+rotated activation quantization in 128-value blocks, GPTQ weight digits, exact
+integer dot products accumulated through a fixed FP32 chain, and integer
+attention with tabulated 14-bit softmax weights. Every reduction in the
+contract is exact or has a prescribed order, so a sequence's vector depends
+only on its tokens. The CPU and CUDA backends implement the contract with
+identical vector bits for every input length and batch composition, which the
+test suite checks at every supported length and with exhaustive checks of the
+elementary functions. Version 0.1.0 runs the mode for E5-large-v1; its other
+models run in float precision. On an
+NVIDIA RTX 4000 SFF Ada Generation, KodamaEmbed in this mode is the fastest
+engine at seven fixed query lengths from 16 to 512 tokens: the fastest of
+ONNX Runtime,
+TensorRT and PyTorch at FP16 takes 1.07 to 2.15 times as long. On six
+efficiency cores of an Intel Core i5-13500, the faster of ONNX Runtime and
+PyTorch at FP32 takes 1.80 to 2.38 times as long at those lengths.
+Binary-relevance nDCG@10 differs
+from FP32 by less than 0.002 on each of four dataset aggregates. All 13
+individual retrieval tasks pass the quality gates.
+\end{abstract}
+
+\section{Introduction}
+
+Retrieval systems embed a corpus once and embed queries continuously. Corpus
+vectors must remain comparable with later query vectors, which may be computed
+on another device or in a different batch. Floating-point kernels can sum the
+same inputs in different orders, changing the last bits of a vector when a
+runtime selects a different execution plan. For short queries, kernel launches
+and synchronization also contribute to end-to-end latency.
+
+KodamaEmbed addresses both with an exactly specified approximate encoder. The
+centered INT8 mode replaces floating-point accumulation with exact integer
+arithmetic wherever the computation allows, and fixes the order of every
+remaining floating-point operation. Its CPU and CUDA implementations then
+agree to the bit, and a vector does not depend on the batch in which it was
+computed.
+Corpus and query vectors may come from either device. The CUDA backend is
+built for short inputs: a batch of up to 16 tokens can run every layer in one
+cooperative launch.
+
+This report makes four contributions:
+\begin{itemize}
+\item a numerical contract for BERT embedding encoders in which every
+  reduction is exact or has a prescribed order (Section~\ref{sec:contract});
+\item CPU and CUDA implementations of that contract with identical vector
+  bits, and the tests that verify them (Section~\ref{sec:identity});
+\item a CUDA execution design for short inputs (Section~\ref{sec:cuda});
+\item a matched latency comparison against three FP16 runtimes on a GPU and
+  two FP32 runtimes on a processor, and a retrieval-quality evaluation
+  against FP32, with published receipts (Section~\ref{sec:evaluation}).
+\end{itemize}
+
+The centered mode approximates FP32 inference and accepts one exact
+checkpoint, E5-large-v1~\cite{wang2022e5}; the performance results come from
+one GPU and one processor. Section~\ref{sec:limitations} states the scope of
+the results.
+
+\section{Background and related work}
+
+\paragraph{Embedding encoders.}
+BERT~\cite{devlin2019} encoders produce sentence embeddings by pooling their
+final hidden states; Sentence-BERT~\cite{reimers2019} established mean-pooled
+siamese training, MiniLM~\cite{wang2020minilm} distills compact encoders, and
+E5~\cite{wang2022e5} trains embeddings contrastively with query and passage
+prefixes. KodamaEmbed serves these and other BERT encoders and
+ModernBERT~\cite{warner2025} encoders, pooled and L2-normalized as each model
+card prescribes.
+
+\paragraph{Quantization.}
+Post-training INT8 inference for transformers must handle activation
+outliers~\cite{dettmers2022,xiao2023}. GPTQ~\cite{frantar2023} chooses weight
+digits that compensate rounding error using a calibration Hessian.
+Rotations spread outliers across channels before quantization;
+QuaRot~\cite{ashkboos2024} applies Hadamard transforms for this purpose.
+Centering is also established: HadaNorm~\cite{federici2025} removes per-channel
+means before a Hadamard transform, and SageAttention~\cite{zhang2025sage}
+and SageAttention2~\cite{zhang2025sage2} subtract mean components of attention
+operands before low-bit quantization. REx~\cite{yvinec2023} expands a
+quantized network in residual quantization errors. KodamaEmbed combines static
+centers per token class, block Hadamard rotation, GPTQ digits and one residual
+term, a second INT8 digit of the operand at two projections; its contribution
+is the exactly specified arithmetic around these established techniques.
+
+\paragraph{Reproducibility.}
+Floating-point addition is not associative, so changing the order of a
+parallel sum can change its result~\cite{demmel2015}.
+Batch-invariant kernels remove the dependence of LLM outputs on batch
+composition within one implementation~\cite{he2025}. KodamaEmbed requires more:
+equal bits across a CPU and a GPU implementation. It obtains them by
+accumulating in exact integers and fixing the order of every remaining
+floating-point operation.
+
+\section{The centered INT8 contract}
+\label{sec:contract}
+
+\subsection{Projections}
+
+Each token belongs to one of three static classes: the first token, the last
+token and the interior tokens. Calibration records each class's mean input to
+every projection; its FP16 rounding is the class center $c_t$. A projection
+computes
+\begin{equation}
+y = W(x - c_t) + W c_t + b,
+\end{equation}
+where the shared row $W c_t$ is computed once from the exact FP32 weights in
+binary64 and rounded once. The operand $x$ is rounded to FP16, centered,
+multiplied by fixed signs, rotated by a normalized Hadamard transform within
+128-value blocks, and quantized to INT8 with one step per row and half block,
+the 64 inputs of one part's dot: the half's largest magnitude divided by 127.
+The weights receive the same signs
+and rotation, one scale per output channel, and INT8 digits chosen by GPTQ on
+the Hessian of the centered, rotated calibration operand. The GPTQ solve uses
+Babai's nearest-plane form on a reversed Cholesky factor, and every sum in it
+runs in a fixed order, so the digits do not depend on the thread count.
+
+The product accumulates exact INT32 dots over 64-input parts. Each part's dot
+converts to FP32 exactly and joins the row's sum by one fused multiply-add on
+its part's step, in depth order. The chain restarts at each multiple of the
+hidden width, and the feed-forward down projection adds its segments in a fixed
+order.
+The output-channel scale, the shared row, the bias and the residual or GELU
+follow in a fixed order.
+
+\paragraph{A second operand digit.}
+The last layer's QKV projection and the up projection of the layer before it
+keep a second INT8 digit of each rotated operand value. With $d_1$ the digit
+on the half block's step $s$, the second digit rounds what the first leaves,
+$\mathrm{fma}(-d_1, s, x)$, on the step $s/254$; the first leaves at most
+$s/2$, so the second stays within 127. The product's chain runs on through the
+second digits' parts over the same weight digits, each on its step $s/254$.
+The weights, the centers and the calibrated tables do not change.
+
+\paragraph{Deferred LayerNorm.}
+For the LayerNorms before the feed-forward up projection and the later layers'
+QKV projections, the encoder uses
+\begin{equation}
+W\bigl(\gamma \odot (z - \mu)\,r + \beta\bigr) + b
+= r\bigl(W(\gamma \odot z) - \mu\,W\gamma\bigr) + W\beta + b,
+\end{equation}
+so the row's statistics $\mu$ and $r$ enter only the projection epilogue and
+the raw row is quantized first.
+
+\subsection{Integer attention}
+
+Queries are quantized to INT8 per row. Keys are first centered on a static
+key center, which shifts all of a query's scores by the same amount and so
+leaves softmax unchanged, then quantized per row. A score is the exact integer
+dot times the key's scale. The exponent of a score's distance from its row's
+largest score, in units of $2^{-8}$ in $\log_2$, indexes a table of 14-bit
+weights $\mathrm{RNE}(16383 \cdot 2^{-u/256})$. At a whole octave the entry
+rounds the exact quotient $16383 / 2^k$, and every other entry lies far from
+a rounding tie, so any faithful $\exp_2$ produces the same table. The
+weights' sum is an exact integer.
+
+Values are quantized to INT8 per sequence and channel, with a step taken over
+the non-sink tokens. Each 14-bit weight splits into two 7-bit digits, so the
+weighted sums of values use INT8 products and stay exact in INT32 up to 512
+keys ($512 \cdot 16383 \cdot 127 < 2^{31}$). The first and last tokens draw the
+most attention, so their values keep FP16 precision: their entries in the
+quantized values are zero, and the last step adds their terms explicitly:
+\begin{equation}
+o = \bigl((p\,s + w_{\mathrm{first}} v_{\mathrm{first}})
+      + w_{\mathrm{last}} v_{\mathrm{last}}\bigr)\cdot\frac{1}{T},
+\end{equation}
+where $p$ is the exact integer product sum, $s$ the value step and $T$ the
+integer weight total.
+
+\subsection{Element-wise operations and pooling}
+
+GELU uses the Abramowitz and Stegun erf approximation~\cite{abramowitz1964}
+(7.1.28) with a prescribed sequence of fused multiply-adds. LayerNorm
+statistics sum in a fixed lane order. Mean pooling sums FP16 values as exact
+integers in units of $2^{-24}$; a sequence of at most 512 values stays below
+$2^{49}$ units, where every binary64 partial sum is exact. The mean is formed
+by integer long division with a sticky bit, which rounds as the binary64
+division would. The norm sums squares in a fixed order, and each output
+equals the CPU's binary64 quotient rounded to FP32.
+
+\subsection{Consequences}
+
+Each sequence's vector is a deterministic function of its tokens and the
+calibrated tables. It does not depend on the other sequences in a batch, the
+thread count or the device. Calibration runs one FP32 forward pass over 128
+passages shipped with the engine, over queries formed from each passage's
+first 16 words, and over 1,024 queries of one to three vocabulary pieces drawn
+by a fixed generator, then solves GPTQ per projection. Its tables are cached
+under a
+fingerprint that covers the model files, prefixes, truncation, numerical
+sources and platform.
+
+\section{Bit-identical implementations}
+\label{sec:identity}
+
+The CPU implementation uses AVX2, FMA and F16C, with AVX-VNNI for the integer
+products. The CUDA implementation performs the same IEEE operations in the
+same order. Explicit rounding intrinsics keep the compiler from contracting or
+reordering floating-point operations, and fused multiply-adds appear exactly
+where the CPU uses them. Work is split across threads only where order cannot
+matter: exact integer sums, exact binary64 sums of FP16 values, and maxima.
+
+On the GPU, a quotient is formed from a correctly rounded reciprocal, computed
+without the approximate hardware reciprocal, and one fused multiply-add
+correction. For the divisors that occur, integers below
+$2^{21}$, and dividends of magnitude $2^{-60}$ to $2^{60}$, every intermediate
+stays normal; an exhaustive check of every dividend in $[1, 2)$ against every
+divisor in $[2^{20}, 2^{21})$ therefore covers the range by scaling.
+
+The test suite compares the CUDA and CPU encoders bit for bit at every input
+length from 1 to 512 tokens and on random batches, including the thresholds
+between execution plans and storage reuse. Exhaustive
+checks cover GELU on all $2^{32}$ floats, the quotient range above, the
+attention-weight index and quantization steps on every float, and the integer
+conversion of every FP16 value. The reciprocal is checked against the
+division on every normal float below $2^{126}$.
+
+Calibration is deterministic as well: the GPTQ solve and every calibration
+sum run in a fixed order. In the release measurement, CUDA vectors for 26
+real-data files, 27,541 rows of SciFact, NFCorpus, FiQA and LoCoMo passages
+and queries, equal the CPU's vectors byte for byte.
+
+\section{CUDA execution}
+\label{sec:cuda}
+
+The encoder packs variable-length sequences without padding. Batches of more
+than 16 tokens run per-layer kernels. Projections use INT8 tensor-core
+products with tile shapes chosen by row count, and their epilogues fuse the
+residual, GELU and the next projection's quantization, or the packing of
+attention operands. Batches of up to 1,024 tokens replay cached CUDA graphs.
+
+Batches of up to 16 tokens can run a persistent plan that executes every
+layer in one cooperative launch. Each multiprocessor holds one resident block.
+Weights stream through it with evict-first loads, so they do not displace the
+activations in L2, while worker warps prepare row-local values; counted
+hand-offs order shared inputs between blocks. Shared-memory
+stream slots have an explicit completion contract: each participating lane
+acquires the barrier phase before reading the slot, and warp participation
+reconverges before execution proceeds. A plan runs only after passing
+geometry, multiprocessor-layout, cooperative-launch and residency checks;
+otherwise the batch uses the per-layer route with the same arithmetic.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+All measurements use KodamaEmbed 0.1.0 on one system: Linux 6.8, an Intel
+Core i5-13500 and an NVIDIA RTX 4000 SFF Ada Generation (driver 595.112.07)
+under its 70\,W power limit. The model is E5-large-v1 (24 layers, hidden
+width 1024) at a pinned revision, with mean pooling and L2 normalization.
+
+\subsection{Latency}
+
+Each call takes one query text and returns its normalized FP32 embedding on
+the host, so tokenization, transfer, inference, pooling and normalization are
+timed together. Every engine receives the same text, prefix, truncation,
+token IDs and segment IDs. Inputs are SciFact word prefixes whose encoded
+lengths, including special tokens and E5's \texttt{query:~} prefix, are
+exactly the lengths in Table~\ref{tab:latency}; at the model's maximum length
+the text is truncated. KodamaEmbed runs centered INT8 through its public API.
+On the GPU, ONNX Runtime~1.30.0 runs an FP16 graph with TF32 disabled and CUDA
+graph replay; TensorRT~10.16.1.11 runs through ONNX Runtime's TensorRT
+provider at FP16 with builder optimization level~5, a fixed shape per case and
+CUDA graph replay; PyTorch~2.14.1 runs FP16 BERT with scaled-dot-product
+attention and CUDA graphs. On the processor, ONNX Runtime and PyTorch run FP32
+graphs, and every engine has six threads. The other engines pool and
+normalize with FP32 operations.
+
+One benchmark process runs at a time, in three rounds that reverse the
+previous round's order. Each process settles for 30 seconds after loading,
+warms up for at least 2 seconds and 20 calls, and records 51 samples of three
+calls, keeping every returned output alive until its sample's clock stops.
+Processes run at nice~19 on six efficiency cores. Before each GPU process,
+three consecutive GPU samples five seconds apart must show at most
+86\,\textdegree C, an enforced power limit of at least 70\,W, and no software
+power cap or thermal slowdown; 100\,ms telemetry must cover the timed window,
+and a low enforced limit or thermal slowdown during timing rejects the
+process. The GPU also held another workload's idle compute context, and every
+gate sample showed 0\% utilization. Each result is the median of three
+process medians. Table~\ref{tab:latency} lists all 14 workloads.
+
+\begin{table}[t]
+\centering
+\setlength{\tabcolsep}{5pt}
+\caption{Single-query latency of E5-large-v1 in milliseconds, on the GPU
+(top) and on six efficiency cores (bottom), each the median of three process
+medians. The last column divides the fastest other engine's latency by
+KodamaEmbed's, from unrounded values.}
+\label{tab:latency}
+\begin{tabular}{rrrrrr}
+\toprule
+Tokens & KodamaEmbed & ONNX Runtime & TensorRT & PyTorch & Fastest other \\
+ & INT8 & FP16 & FP16 & FP16 & / KodamaEmbed \\
+\midrule
+16 & 1.325 & 2.910 & 2.846 & 3.189 & 2.15 \\
+33 & 1.594 & 3.035 & 2.932 & 3.395 & 1.84 \\
+64 & 1.814 & 3.170 & 3.088 & 3.641 & 1.70 \\
+65 & 2.044 & 3.323 & 3.165 & 3.747 & 1.55 \\
+128 & 2.595 & 3.851 & 3.476 & 4.022 & 1.34 \\
+256 & 4.643 & 5.173 & 4.968 & 5.599 & 1.07 \\
+512 & 7.777 & 9.635 & 8.415 & 9.897 & 1.08 \\
+\bottomrule
+\end{tabular}
+
+\vspace{2ex}
+\begin{tabular}{rrrrr}
+\toprule
+Tokens & KodamaEmbed & ONNX Runtime & PyTorch & Fastest other \\
+ & INT8 & FP32 & FP32 & / KodamaEmbed \\
+\midrule
+16 & 23.7 & 56.4 & 87.2 & 2.38 \\
+33 & 45.9 & 97.4 & 125.9 & 2.12 \\
+64 & 85.4 & 173.1 & 293.1 & 2.03 \\
+65 & 87.1 & 176.5 & 294.2 & 2.03 \\
+128 & 183.7 & 337.6 & 446.4 & 1.84 \\
+256 & 376.9 & 678.5 & 783.7 & 1.80 \\
+512 & 771.8 & 1466.2 & 1474.6 & 1.90 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+At each of the seven fixed lengths, KodamaEmbed with centered INT8 is the
+fastest engine on both devices: its slowest process median is below the
+fastest process median
+of every FP16 competitor on the GPU and every FP32 competitor on the
+processor. The second-fastest engine on the GPU, TensorRT at each length,
+takes 1.07 to 2.15 times as long as centered INT8; on the processor, ONNX
+Runtime takes 1.80 to 2.38 times as long.
+A second measurement runs one text of each length from 16 to 512 tokens in a
+fixed order. A fresh session makes three passes without a separate warm-up.
+On the later two passes, centered INT8 again has the lowest mean latency;
+the second lowest, ONNX Runtime's, is 1.27 times it.
+
+\subsection{Retrieval quality}
+
+Centered INT8 approximates FP32, so its vectors are compared with FP32 CPU
+vectors of the same data under fixed gates: mean cosine distance at most
+0.001 for passages and queries, maximum L2 deviation at most 0.1, unit-norm
+error at most $10^{-5}$, mean top-10 overlap at least 0.9, and losses of at
+most 0.005 in nDCG@10 and 0.01 in recall@10 and hit@10. Table~\ref{tab:quality}
+reports the evaluation on SciFact, NFCorpus and the first 10,000 passages of
+FiQA from BEIR~\cite{thakur2021}, and on evidence-turn retrieval over
+LoCoMo~\cite{maharana2024}. nDCG@10 uses binary relevance.
+
+\begin{table}[t]
+\centering
+\caption{Centered INT8 against FP32 for E5-large-v1: exhaustive dot-product
+retrieval.}
+\label{tab:quality}
+\begin{tabular}{lrrrrr}
+\toprule
+Dataset & Queries & \multicolumn{2}{c}{nDCG@10} & Query cos.\ dist. & Top-10 overlap \\
+ & & FP32 & Centered & & \\
+\midrule
+SciFact & 300 & 0.7256 & 0.7251 & $2.4\times10^{-5}$ & 0.989 \\
+NFCorpus & 323 & 0.3616 & 0.3616 & $2.1\times10^{-5}$ & 0.985 \\
+FiQA & 243 & 0.5096 & 0.5076 & $2.1\times10^{-5}$ & 0.988 \\
+LoCoMo & 1977 & 0.5506 & 0.5503 & $2.3\times10^{-5}$ & 0.989 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+All four dataset aggregates pass the quality gates, with binary-relevance
+nDCG@10 differing from FP32 by less than 0.002 in each. All 13 individual
+tasks also pass their gates: one each for SciFact, NFCorpus and FiQA, and ten
+LoCoMo conversations. The largest individual nDCG@10 loss is 0.00401 on a
+LoCoMo conversation, within the 0.005 loss limit. FiQA was held out during
+design and calibration.
+
+\section{Limitations}
+\label{sec:limitations}
+
+The centered mode approximates FP32 inference and accepts the one evaluated
+checkpoint, verified by its file hashes. Calibration and CPU-side
+preparation require an x86-64 host with AVX-VNNI, AVX2, FMA and F16C, and CUDA
+execution requires compute capability 8.0 or later. All timings come from one
+GPU under its 70\,W power limit and six efficiency cores of one processor, on
+a server that also ran other workloads, and measure sequential single-query
+latency; throughput, concurrent serving and cold starts are outside this
+evaluation. In the fixed-length comparison, all three GPU competitors used
+FP16 and CUDA graph replay. In the changing-length comparison, ONNX Runtime
+and TensorRT used dynamic shapes without CUDA graph replay, and PyTorch ran
+eagerly. Three of the four quality datasets were
+used during development. Bit-exact comparisons on the tested device and
+workloads do not establish freedom from data races on other devices or
+workloads.
+
+\section{Conclusion}
+
+An approximate encoder can be exactly specified. By accumulating in
+exact integers and fixing the order of every remaining floating-point
+operation, KodamaEmbed makes centered INT8 BERT embeddings identical across its
+CPU and CUDA backends and independent of batch composition, while serving
+short queries at low latency. The source, its tests, the benchmark harness and
+the receipts behind every measurement in this report are released with
+KodamaEmbed under the Apache-2.0 license.
+
+\begin{thebibliography}{99}
+\small
+
+\bibitem{abramowitz1964}
+M.~Abramowitz and I.~A. Stegun, editors.
+\newblock \emph{Handbook of Mathematical Functions with Formulas, Graphs, and
+  Mathematical Tables}.
+\newblock National Bureau of Standards, 1964.
+
+\bibitem{ashkboos2024}
+S.~Ashkboos, A.~Mohtashami, M.~L. Croci, B.~Li, P.~Cameron, M.~Jaggi,
+  D.~Alistarh, T.~Hoefler, and J.~Hensman.
+\newblock {QuaRot}: Outlier-free 4-bit inference in rotated {LLMs}.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2024.
+\newblock arXiv:2404.00456.
+
+\bibitem{demmel2015}
+J.~Demmel and H.~D. Nguyen.
+\newblock Parallel reproducible summation.
+\newblock \emph{IEEE Transactions on Computers}, 64(7):2060--2070, 2015.
+
+\bibitem{dettmers2022}
+T.~Dettmers, M.~Lewis, Y.~Belkada, and L.~Zettlemoyer.
+\newblock {LLM.int8()}: 8-bit matrix multiplication for transformers at scale.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2022.
+\newblock arXiv:2208.07339.
+
+\bibitem{devlin2019}
+J.~Devlin, M.-W. Chang, K.~Lee, and K.~Toutanova.
+\newblock {BERT}: Pre-training of deep bidirectional transformers for language
+  understanding.
+\newblock In \emph{Proceedings of NAACL-HLT}, 2019.
+\newblock arXiv:1810.04805.
+
+\bibitem{federici2025}
+M.~Federici, R.~Del~Chiaro, B.~van Breugel, P.~Whatmough, and M.~Nagel.
+\newblock {HadaNorm}: Diffusion transformer quantization through mean-centered
+  transformations.
+\newblock In \emph{ES-FoMo III Workshop at the International Conference on
+  Machine Learning}, 2025.
+\newblock arXiv:2506.09932.
+
+\bibitem{frantar2023}
+E.~Frantar, S.~Ashkboos, T.~Hoefler, and D.~Alistarh.
+\newblock {GPTQ}: Accurate post-training quantization for generative
+  pre-trained transformers.
+\newblock In \emph{International Conference on Learning Representations}, 2023.
+\newblock arXiv:2210.17323.
+
+\bibitem{he2025}
+H.~He and Thinking Machines Lab.
+\newblock Defeating nondeterminism in {LLM} inference.
+\newblock \emph{Thinking Machines Lab: Connectionism}, 2025.
+\newblock
+  \url{https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/}.
+
+\bibitem{maharana2024}
+A.~Maharana, D.-H. Lee, S.~Tulyakov, M.~Bansal, F.~Barbieri, and Y.~Fang.
+\newblock Evaluating very long-term conversational memory of {LLM} agents.
+\newblock In \emph{Proceedings of ACL}, 2024.
+\newblock arXiv:2402.17753.
+
+\bibitem{reimers2019}
+N.~Reimers and I.~Gurevych.
+\newblock Sentence-{BERT}: Sentence embeddings using siamese {BERT}-networks.
+\newblock In \emph{Proceedings of EMNLP-IJCNLP}, 2019.
+\newblock arXiv:1908.10084.
+
+\bibitem{thakur2021}
+N.~Thakur, N.~Reimers, A.~R{\"u}ckl{\'e}, A.~Srivastava, and I.~Gurevych.
+\newblock {BEIR}: A heterogeneous benchmark for zero-shot evaluation of
+  information retrieval models.
+\newblock In \emph{NeurIPS Datasets and Benchmarks Track}, 2021.
+\newblock arXiv:2104.08663.
+
+\bibitem{wang2020minilm}
+W.~Wang, F.~Wei, L.~Dong, H.~Bao, N.~Yang, and M.~Zhou.
+\newblock {MiniLM}: Deep self-attention distillation for task-agnostic
+  compression of pre-trained transformers.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2020.
+\newblock arXiv:2002.10957.
+
+\bibitem{wang2022e5}
+L.~Wang, N.~Yang, X.~Huang, B.~Jiao, L.~Yang, D.~Jiang, R.~Majumder, and F.~Wei.
+\newblock Text embeddings by weakly-supervised contrastive pre-training.
+\newblock arXiv:2212.03533, 2022.
+
+\bibitem{warner2025}
+B.~Warner, A.~Chaffin, B.~Clavi{\'e}, O.~Weller, O.~Hallstr{\"o}m,
+  S.~Taghadouini, A.~Gallagher, R.~Biswas, F.~Ladhak, T.~Aarsen, N.~Cooper,
+  G.~Adams, J.~Howard, and I.~Poli.
+\newblock Smarter, better, faster, longer: A modern bidirectional encoder for
+  fast, memory efficient, and long context finetuning and inference.
+\newblock In \emph{Proceedings of ACL}, 2025.
+\newblock arXiv:2412.13663.
+
+\bibitem{xiao2023}
+G.~Xiao, J.~Lin, M.~Seznec, H.~Wu, J.~Demouth, and S.~Han.
+\newblock {SmoothQuant}: Accurate and efficient post-training quantization for
+  large language models.
+\newblock In \emph{International Conference on Machine Learning}, 2023.
+\newblock arXiv:2211.10438.
+
+\bibitem{yvinec2023}
+E.~Yvinec, A.~Dapogny, M.~Cord, and K.~Bailly.
+\newblock {REx}: Data-free residual quantization error expansion.
+\newblock In \emph{Advances in Neural Information Processing Systems}, 2023.
+\newblock arXiv:2203.14645.
+
+\bibitem{zhang2025sage}
+J.~Zhang, J.~Wei, P.~Zhang, J.~Zhu, and J.~Chen.
+\newblock {SageAttention}: Accurate 8-bit attention for plug-and-play inference
+  acceleration.
+\newblock In \emph{International Conference on Learning Representations}, 2025.
+\newblock arXiv:2410.02367.
+
+\bibitem{zhang2025sage2}
+J.~Zhang, H.~Huang, P.~Zhang, J.~Wei, J.~Zhu, and J.~Chen.
+\newblock {SageAttention2}: Efficient attention with thorough outlier smoothing
+  and per-thread {INT4} quantization.
+\newblock In \emph{International Conference on Machine Learning}, 2025.
+\newblock arXiv:2411.10958.
+
+\end{thebibliography}
+
+\end{document}

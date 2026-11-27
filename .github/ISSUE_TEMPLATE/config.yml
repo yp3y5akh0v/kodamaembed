@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/yp3y5akh0v/kodamaembed/security/advisories/new
+    about: Privately, as SECURITY.md describes.
+  - name: Ask a question
+    url: https://github.com/yp3y5akh0v/kodamaembed/discussions
+    about: Questions and ideas go to Discussions.

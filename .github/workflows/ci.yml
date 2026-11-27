@@ -1,0 +1,260 @@
+name: checks
+on:
+  push:
+    branches: [master]
+  pull_request:
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+# Every job's Rust comes from rust-toolchain.toml, except msrv, which checks
+# the oldest version Cargo.toml promises.
+jobs:
+  portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+      - name: Check public file contents
+        shell: pwsh
+        run: |
+          ./scripts/test-release.ps1
+          ./scripts/check-release.ps1
+      - name: Check the benchmark harness without a GPU
+        working-directory: scripts/benchmarks
+        run: python -m unittest test_process test_telemetry test_runner test_quality
+      - run: cargo fmt --all --check
+      - name: Check the portable CPU backend on a non-x86 target
+        run: cargo check -p kodamaembed-cpu --lib --examples --target wasm32-unknown-unknown --locked
+        env:
+          RUSTFLAGS: -D warnings
+      - name: Check the model API on a target without threads or GPU drivers
+        run: cargo check -p kodamaembed --lib --no-default-features --target wasm32-unknown-unknown --locked
+        env:
+          RUSTFLAGS: -D warnings
+      - name: Check CUDA development targets on ARM Linux
+        if: runner.os == 'Linux'
+        run: |
+          rustup target add aarch64-unknown-linux-gnu
+          cargo check -p kodamaembed-cuda --all-targets --target aarch64-unknown-linux-gnu --locked
+        env:
+          RUSTFLAGS: -D warnings
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test -p kodamaembed --locked
+      - run: cargo test -p kodamaembed --examples --locked
+      - run: cargo test -p kodamaembed-model --locked
+      - run: cargo test -p kodamaembed-cpu --locked
+      - run: cargo test -p kodamaembed-validate --locked
+      - run: cargo test -p kodamaembed-cpu --examples --locked
+      - run: cargo test -p kodamaembed-cuda -p kodamaembed-vulkan --lib --locked
+      - run: cargo test -p kodamaembed-cuda -p kodamaembed-vulkan --doc --locked
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+      - name: Check the workspace with the Rust version Cargo.toml promises
+        run: |
+          msrv=$(python -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['workspace']['package']['rust-version'])")
+          rustup toolchain install "$msrv" --profile minimal
+          cargo "+$msrv" check --workspace --locked
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustup target add wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+      # The runner must be the version of the wasm-bindgen crate the tests link.
+      - name: Install the test runner of the locked wasm-bindgen
+        run: |
+          version=$(python -c "import tomllib; print(next(p['version'] for p in tomllib.load(open('Cargo.lock', 'rb'))['package'] if p['name'] == 'wasm-bindgen'))")
+          cargo install wasm-bindgen-cli --version "$version" --locked
+      - name: Run the model API inside Node's JavaScript engine
+        run: cargo test -p kodamaembed --lib --no-default-features --target wasm32-unknown-unknown --locked
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+  licenses:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Check that the third-party license file is current
+        run: |
+          cargo install cargo-about --version 0.9.1 --locked --features cli
+          generated="$RUNNER_TEMP/THIRD_PARTY_LICENSES.html"
+          log="$RUNNER_TEMP/cargo-about.log"
+          if ! cargo about generate --manifest-path crates/kodamaembed-python/Cargo.toml \
+            --config packaging/licenses/about.toml --locked --fail \
+            --output-file "$generated" packaging/licenses/about.hbs > "$log" 2>&1; then
+            cat "$log"
+            exit 1
+          fi
+          cat "$log"
+          # A stale clarification checksum only warns; cargo-about then scans silently.
+          if grep -q 'failed to validate all files specified in clarification' "$log"; then
+            echo "::error::a clarification in packaging/licenses/about.toml no longer matches its crate"
+            exit 1
+          fi
+          sed -i -E 's/\r$//; s/[[:blank:]]+$//' "$generated"
+          if ! cmp -s packaging/licenses/THIRD_PARTY_LICENSES.html "$generated"; then
+            echo "::error::packaging/licenses/THIRD_PARTY_LICENSES.html is stale"
+            diff -u packaging/licenses/THIRD_PARTY_LICENSES.html "$generated" || true
+            exit 1
+          fi
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.20.2
+          checksum: true
+          fallback: none
+      - run: cargo deny --manifest-path crates/kodamaembed-python/Cargo.toml --locked check licenses advisories sources
+  kernels:
+    # nvcc 12.9 rejects GCC newer than 14; Ubuntu 24.04 ships GCC 13.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install nvcc 12.9.86
+        run: |
+          bash scripts/install-nvcc.sh "$RUNNER_TEMP/cuda"
+          echo "$RUNNER_TEMP/cuda/bin" >> "$GITHUB_PATH"
+      - name: Rebuild the kernels and compare them with the shipped PTX
+        shell: pwsh
+        run: |
+          ./scripts/build-kernels.ps1
+          $changed = git status --porcelain -- crates/kodamaembed-cuda/ptx
+          if ($changed) { throw "The rebuilt PTX differs from the shipped files: $changed" }
+  shaders:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install glslc from Vulkan SDK 1.4.328.1
+        run: |
+          bash scripts/install-glslc.sh "$RUNNER_TEMP/vulkan"
+          echo "$RUNNER_TEMP/vulkan/bin" >> "$GITHUB_PATH"
+      - name: Rebuild the shaders and compare them with the shipped SPIR-V
+        shell: pwsh
+        run: |
+          ./scripts/build-shaders.ps1
+          $changed = git status --porcelain -- crates/kodamaembed-vulkan/spv
+          if ($changed) { throw "The rebuilt SPIR-V differs from the shipped files: $changed" }
+  receipts:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.15'
+      - name: Verify published benchmark evidence
+        run: python scripts/benchmarks/test_published_receipts.py
+  harness:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: scripts/benchmarks/requirements-export.txt
+      # PyTorch's CPU wheel comes first, so Linux installs no CUDA libraries.
+      - name: Install the CPU benchmark environment
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = Linux ]; then
+            python -m pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+          fi
+          python -m pip install -r scripts/benchmarks/requirements-export.txt
+      - name: Run the ONNX Runtime and PyTorch engines through the harness on the CPU
+        working-directory: scripts/benchmarks
+        run: python -m unittest test_matched test_public_acceptance test_torch_query test_rotation test_sequence
+  python:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.15']
+        include:
+          - python: '3.11'
+            numpy: numpy==1.23.2
+          - python: '3.15'
+            numpy: numpy
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/huggingface/hub
+          key: huggingface-minilm-ms-marco
+      # This wheel installs only where it was built, so it needs no manylinux tag.
+      - name: Build, install and test the wheel
+        shell: bash
+        env:
+          NUMPY: ${{ matrix.numpy }}
+        run: |
+          python -m pip install --upgrade pip maturin
+          maturin build --release --locked --compatibility linux --out dist
+          python -m pip install dist/*.whl "$NUMPY" --group test
+          python -m pytest -p no:cacheprovider

@@ -1,0 +1,51 @@
+#version 460
+// FP16 output for the next GEMM; `write32` adds an FP32 copy for the residual.
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0) in;
+
+const uint QUARTER = gl_WorkGroupSize.x, WIDTH = 4 * QUARTER;
+
+layout(std430, binding = 0) readonly buffer X { vec4 x[]; };
+layout(std430, binding = 1) readonly buffer Gamma { vec4 gamma[]; };
+layout(std430, binding = 2) readonly buffer Beta { vec4 beta[]; };
+layout(std430, binding = 3) writeonly buffer Out16 { f16vec4 out16[]; };
+layout(std430, binding = 4) writeonly buffer Out32 { vec4 out32[]; };
+
+layout(push_constant) uniform Push {
+    uint rows;
+    uint write32;
+    float eps;
+} p;
+
+shared float partial[64];
+
+float block_sum(float value) {
+    value = subgroupAdd(value);
+    if (subgroupElect()) partial[gl_SubgroupID] = value;
+    barrier();
+    float total = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) total += partial[i];
+    barrier();
+    return total;
+}
+
+void main() {
+    const uint row = gl_WorkGroupID.x;
+    const uint column = gl_LocalInvocationID.x;
+    const uint at = row * QUARTER + column;
+    const vec4 v = x[at];
+    const float mean = block_sum((v.x + v.y) + (v.z + v.w)) / float(WIDTH);
+    const vec4 d = v - mean;
+    const float variance = block_sum(dot(d, d)) / float(WIDTH);
+    const float denominator = variance + p.eps;
+    const float rstd = inversesqrt(denominator);
+    // inversesqrt(+inf) is zero and would hide an overflowing variance.
+    const vec4 y = (isnan(denominator) || isinf(denominator))
+        ? vec4(uintBitsToFloat(0x7fc00000u))
+        : d * rstd * gamma[column] + beta[column];
+    out16[at] = f16vec4(y);
+    if (p.write32 != 0) out32[at] = y;
+}

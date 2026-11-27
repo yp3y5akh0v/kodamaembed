@@ -1,0 +1,245 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "e5-b1-l16",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l16.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l16"
+    },
+    {
+      "name": "e5-b1-l33",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l33.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l33"
+    },
+    {
+      "name": "e5-b1-l64",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l64.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l64"
+    },
+    {
+      "name": "e5-b1-l65",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l65.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l65"
+    },
+    {
+      "name": "e5-b1-l128",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l128.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l128"
+    },
+    {
+      "name": "e5-b1-l256",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l256.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l256"
+    },
+    {
+      "name": "e5-b1-l512",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5/e5-b1-l512.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-b1-l512"
+    },
+    {
+      "name": "minilm-b1-l16",
+      "checkpoint": "../../models/minilm",
+      "fixture": "fixtures/minilm/minilm-b1-l16.json",
+      "cuda_onnx": "../minilm-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../minilm-onnx/model-pooled.onnx",
+      "cpu_onnx": "../minilm-onnx/model-pooled.onnx",
+      "export_receipt": "../minilm-onnx/export.json",
+      "trt_cache": "cache/minilm-b1-l16"
+    },
+    {
+      "name": "minilm-b1-l33",
+      "checkpoint": "../../models/minilm",
+      "fixture": "fixtures/minilm/minilm-b1-l33.json",
+      "cuda_onnx": "../minilm-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../minilm-onnx/model-pooled.onnx",
+      "cpu_onnx": "../minilm-onnx/model-pooled.onnx",
+      "export_receipt": "../minilm-onnx/export.json",
+      "trt_cache": "cache/minilm-b1-l33"
+    },
+    {
+      "name": "minilm-b1-l64",
+      "checkpoint": "../../models/minilm",
+      "fixture": "fixtures/minilm/minilm-b1-l64.json",
+      "cuda_onnx": "../minilm-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../minilm-onnx/model-pooled.onnx",
+      "cpu_onnx": "../minilm-onnx/model-pooled.onnx",
+      "export_receipt": "../minilm-onnx/export.json",
+      "trt_cache": "cache/minilm-b1-l64"
+    },
+    {
+      "name": "minilm-b1-l65",
+      "checkpoint": "../../models/minilm",
+      "fixture": "fixtures/minilm/minilm-b1-l65.json",
+      "cuda_onnx": "../minilm-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../minilm-onnx/model-pooled.onnx",
+      "cpu_onnx": "../minilm-onnx/model-pooled.onnx",
+      "export_receipt": "../minilm-onnx/export.json",
+      "trt_cache": "cache/minilm-b1-l65"
+    },
+    {
+      "name": "minilm-b1-l128",
+      "checkpoint": "../../models/minilm",
+      "fixture": "fixtures/minilm/minilm-b1-l128.json",
+      "cuda_onnx": "../minilm-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../minilm-onnx/model-pooled.onnx",
+      "cpu_onnx": "../minilm-onnx/model-pooled.onnx",
+      "export_receipt": "../minilm-onnx/export.json",
+      "trt_cache": "cache/minilm-b1-l128"
+    },
+    {
+      "name": "minilm-b1-l256",
+      "checkpoint": "../../models/minilm",
+      "fixture": "fixtures/minilm/minilm-b1-l256.json",
+      "cuda_onnx": "../minilm-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../minilm-onnx/model-pooled.onnx",
+      "cpu_onnx": "../minilm-onnx/model-pooled.onnx",
+      "export_receipt": "../minilm-onnx/export.json",
+      "trt_cache": "cache/minilm-b1-l256"
+    },
+    {
+      "name": "modernbert-embed-b1-l16",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l16.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l16"
+    },
+    {
+      "name": "modernbert-embed-b1-l33",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l33.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l33"
+    },
+    {
+      "name": "modernbert-embed-b1-l64",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l64.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l64"
+    },
+    {
+      "name": "modernbert-embed-b1-l65",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l65.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l65"
+    },
+    {
+      "name": "modernbert-embed-b1-l128",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l128.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l128"
+    },
+    {
+      "name": "modernbert-embed-b1-l256",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l256.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l256"
+    },
+    {
+      "name": "modernbert-embed-b1-l512",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l512.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l512"
+    },
+    {
+      "name": "modernbert-embed-b1-l1024",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l1024.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l1024"
+    },
+    {
+      "name": "modernbert-embed-b1-l2048",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l2048.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l2048"
+    },
+    {
+      "name": "modernbert-embed-b1-l4096",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l4096.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l4096"
+    },
+    {
+      "name": "modernbert-embed-b1-l8192",
+      "checkpoint": "../../models/modernbert-embed-base",
+      "fixture": "fixtures/modernbert-embed/modernbert-embed-b1-l8192.json",
+      "cuda_onnx": "../modernbert-embed-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "cpu_onnx": "../modernbert-embed-onnx/model-pooled.onnx",
+      "export_receipt": "../modernbert-embed-onnx/export.json",
+      "trt_cache": "cache/modernbert-embed-b1-l8192"
+    }
+  ]
+}

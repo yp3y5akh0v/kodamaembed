@@ -1,0 +1,126 @@
+#version 460
+// The next K tile loads into registers while this one multiplies; rows pad to 40 halves so a
+// matrix load's eight rows hit distinct bank groups. Named variables keep matrices in registers.
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_GOOGLE_include_directive : require
+
+layout(local_size_x = 256) in;
+layout(constant_id = 0) const uint EPILOGUE = 0;
+layout(constant_id = 1) const uint LOW_COLUMNS = 0;
+
+layout(std430, binding = 0) readonly buffer A { f16vec4 a[]; };
+layout(std430, binding = 1) readonly buffer W { f16vec4 w[]; };
+#include "epilogue.glsl"
+
+layout(push_constant) uniform Push {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+const uint BM = 128, BN = 128, BK = 32, T = 16, THREADS = 256;
+// Shared rows in f16vec4: BK / 4 of data and 2 of padding.
+const uint CHUNKS = BK / 4, PITCH = CHUNKS + 2;
+const uint STAGE = BM * PITCH;
+const uint COPIES = BM * CHUNKS / THREADS;
+
+#define ACCUMULATOR coopmat<float, gl_ScopeSubgroup, T, T, gl_MatrixUseAccumulator>
+#define MATRIX_A coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseA>
+#define MATRIX_B coopmat<float16_t, gl_ScopeSubgroup, T, T, gl_MatrixUseB>
+
+shared f16vec4 a_tile[2 * STAGE];
+shared f16vec4 w_tile[2 * STAGE];
+shared float staged[THREADS / 32 * T * T];
+
+void emit(uint row0, uint col0) {
+    const uint base = gl_SubgroupID * T * T;
+    subgroupMemoryBarrierShared();
+    subgroupBarrier();
+    for (uint e = gl_SubgroupInvocationID; e < T * T; e += gl_SubgroupSize) {
+        const uint row = row0 + e / T;
+        if (row < p.M) WRITE(row, col0 + e % T, p.N, staged[base + e], staged[base + (e ^ 1u)]);
+    }
+    subgroupBarrier();
+}
+
+void main() {
+    const uint m0 = gl_WorkGroupID.y * BM, n0 = gl_WorkGroupID.x * BN;
+    const uint group = gl_SubgroupID, qm = group / 4, qn = group % 4;
+    const uint thread = gl_LocalInvocationID.x;
+    const uint row_vectors = p.K / 4, k_tiles = p.K / BK;
+    const uint a_row = qm * 4 * T, w_row = qn * 2 * T;
+
+    ACCUMULATOR c00 = ACCUMULATOR(0.0), c01 = ACCUMULATOR(0.0);
+    ACCUMULATOR c10 = ACCUMULATOR(0.0), c11 = ACCUMULATOR(0.0);
+    ACCUMULATOR c20 = ACCUMULATOR(0.0), c21 = ACCUMULATOR(0.0);
+    ACCUMULATOR c30 = ACCUMULATOR(0.0), c31 = ACCUMULATOR(0.0);
+
+    // Rows past M feed only outputs never written, so they load row M - 1:
+    // selecting zeros instead would wait for each load at the select.
+    f16vec4 ra[COPIES], rw[COPIES];
+    for (uint c = 0; c < COPIES; ++c) {
+        const uint i = thread + c * THREADS, row = i / CHUNKS, chunk = i % CHUNKS;
+        ra[c] = a[min(m0 + row, p.M - 1) * row_vectors + chunk];
+        rw[c] = w[(n0 + row) * row_vectors + chunk];
+    }
+
+    for (uint kt = 0; kt < k_tiles; ++kt) {
+        const uint stage = (kt & 1u) * STAGE;
+        for (uint c = 0; c < COPIES; ++c) {
+            const uint i = thread + c * THREADS, at = stage + (i / CHUNKS) * PITCH + i % CHUNKS;
+            a_tile[at] = ra[c];
+            w_tile[at] = rw[c];
+        }
+        barrier();
+        // The last tile reloads itself: a branch around the loads would wait
+        // for them before the products.
+        const uint k4 = min(kt + 1, k_tiles - 1) * CHUNKS;
+        for (uint c = 0; c < COPIES; ++c) {
+            const uint i = thread + c * THREADS, row = i / CHUNKS, chunk = i % CHUNKS;
+            ra[c] = a[min(m0 + row, p.M - 1) * row_vectors + k4 + chunk];
+            rw[c] = w[(n0 + row) * row_vectors + k4 + chunk];
+        }
+        for (uint kk = 0; kk < CHUNKS; kk += T / 4) {
+            const uint at_a = stage + a_row * PITCH + kk, at_w = stage + w_row * PITCH + kk;
+            MATRIX_A a0, a1, a2, a3;
+            MATRIX_B b0, b1;
+            coopMatLoad(a0, a_tile, at_a, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a1, a_tile, at_a + T * PITCH, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a2, a_tile, at_a + 2 * T * PITCH, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(a3, a_tile, at_a + 3 * T * PITCH, PITCH, gl_CooperativeMatrixLayoutRowMajor);
+            // W rows hold K contiguously, so B (K x N) is column-major in them.
+            coopMatLoad(b0, w_tile, at_w, PITCH, gl_CooperativeMatrixLayoutColumnMajor);
+            coopMatLoad(b1, w_tile, at_w + T * PITCH, PITCH, gl_CooperativeMatrixLayoutColumnMajor);
+            c00 = coopMatMulAdd(a0, b0, c00);
+            c01 = coopMatMulAdd(a0, b1, c01);
+            c10 = coopMatMulAdd(a1, b0, c10);
+            c11 = coopMatMulAdd(a1, b1, c11);
+            c20 = coopMatMulAdd(a2, b0, c20);
+            c21 = coopMatMulAdd(a2, b1, c21);
+            c30 = coopMatMulAdd(a3, b0, c30);
+            c31 = coopMatMulAdd(a3, b1, c31);
+        }
+    }
+
+    const uint row0 = m0 + a_row, col0 = n0 + w_row, at = group * T * T;
+    coopMatStore(c00, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0, col0);
+    coopMatStore(c01, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0, col0 + T);
+    coopMatStore(c10, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0 + T, col0);
+    coopMatStore(c11, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0 + T, col0 + T);
+    coopMatStore(c20, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0 + 2 * T, col0);
+    coopMatStore(c21, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0 + 2 * T, col0 + T);
+    coopMatStore(c30, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0 + 3 * T, col0);
+    coopMatStore(c31, staged, at, T, gl_CooperativeMatrixLayoutRowMajor);
+    emit(row0 + 3 * T, col0 + T);
+}

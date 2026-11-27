@@ -1,0 +1,56 @@
+[build-system]
+requires = ["maturin>=1.9.4,<2"]
+build-backend = "maturin"
+
+[project]
+name = "kodamaembed"
+dynamic = ["version"]
+description = "Text embeddings and reranking on CPUs and GPUs"
+readme = "python/README.md"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE", "packaging/licenses/THIRD_PARTY_LICENSES.html"]
+dependencies = ["numpy>=1.23.2"]
+keywords = [
+    "embeddings",
+    "sentence-embeddings",
+    "reranker",
+    "semantic-search",
+    "rag",
+    "cuda",
+    "vulkan",
+]
+classifiers = [
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Text Processing :: Indexing",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/yp3y5akh0v/kodamaembed"
+Documentation = "https://github.com/yp3y5akh0v/kodamaembed/blob/master/docs/python.md"
+Changelog = "https://github.com/yp3y5akh0v/kodamaembed/blob/master/CHANGELOG.md"
+Issues = "https://github.com/yp3y5akh0v/kodamaembed/issues"
+
+[project.scripts]
+kodamaembed = "kodamaembed.cli:main"
+
+[dependency-groups]
+test = ["openai>=1", "pytest>=8"]
+
+[tool.maturin]
+manifest-path = "crates/kodamaembed-python/Cargo.toml"
+python-source = "python"
+module-name = "kodamaembed._kodamaembed"
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+addopts = "--strict-markers -m 'not gpu'"
+markers = ["gpu: needs CUDA and Vulkan GPUs; select with -m gpu"]

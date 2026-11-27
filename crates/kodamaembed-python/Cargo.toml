@@ -1,0 +1,18 @@
+[package]
+name = "kodamaembed-python"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "The native module of the kodamaembed Python package"
+publish = false
+
+[lib]
+name = "_kodamaembed"
+crate-type = ["cdylib"]
+
+[dependencies]
+kodamaembed.workspace = true
+pyo3.workspace = true

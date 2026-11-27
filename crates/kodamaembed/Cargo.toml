@@ -1,0 +1,47 @@
+[package]
+name = "kodamaembed"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Text embeddings and reranking on CPUs and GPUs, with quantized vectors identical on CPUs and NVIDIA GPUs"
+keywords = ["embeddings", "bert", "reranking", "cuda", "vulkan"]
+categories = ["text-processing", "science", "hardware-support"]
+# These tests read the repository's documents, lock file and reference vectors.
+exclude = ["/tests/registry"]
+
+[features]
+default = ["download"]
+# Without it, models that load by name come only from the Hugging Face cache.
+download = ["dep:ureq"]
+
+[dependencies]
+half.workspace = true
+kodamaembed-cpu.workspace = true
+kodamaembed-cuda.workspace = true
+kodamaembed-model.workspace = true
+kodamaembed-vulkan.workspace = true
+rayon.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokenizers.workspace = true
+ureq = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+# Oniguruma is C, which a wasm target does not build: there the tokenizer's regular
+# expressions come from a Rust engine.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokenizers = { workspace = true, features = ["onig"] }
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+tokenizers = { workspace = true, features = ["unstable_wasm"] }
+
+# The unit tests that run inside a JavaScript engine.
+[target.'cfg(target_family = "wasm")'.dev-dependencies]
+wasm-bindgen-test.workspace = true

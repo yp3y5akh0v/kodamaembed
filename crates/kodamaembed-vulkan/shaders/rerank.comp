@@ -1,0 +1,118 @@
+#version 460
+// A cross-encoder's score in FP32: classifier . tanh(pooler . first_row + pooler_bias) +
+// classifier_bias, or with PREDICTION classifier . norm(act(dense . pooled_row)) + classifier_bias.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef PREDICTION
+#extension GL_GOOGLE_include_directive : require
+#endif
+
+layout(local_size_x = 128) in;
+
+layout(constant_id = 0) const uint WIDTH = 384;
+#ifdef PREDICTION
+// The pooled row is the mean of the sequence's rows, not its first; the activation SiLU, not GELU.
+layout(constant_id = 1) const bool MEAN = false;
+layout(constant_id = 2) const bool SILU = false;
+
+#include "gelu.glsl"
+#endif
+
+layout(std430, binding = 0) readonly buffer Hidden { float hidden[]; };
+layout(std430, binding = 1) readonly buffer Cu { int cu[]; };
+layout(std430, binding = 2) readonly buffer PoolerW { float pooler_w[]; };
+// With PREDICTION the norm's scale: its dense layer has no bias.
+layout(std430, binding = 3) readonly buffer PoolerB { float pooler_b[]; };
+layout(std430, binding = 4) readonly buffer ClassifierW { float classifier_w[]; };
+layout(std430, binding = 5) readonly buffer ClassifierB { float classifier_b[]; };
+layout(std430, binding = 6) writeonly buffer Scores { float scores[]; };
+
+#ifdef PREDICTION
+layout(push_constant) uniform Push {
+    float eps;
+} p;
+#endif
+
+// With PREDICTION the pooled row, whichever rows it averages.
+shared float first_row[WIDTH];
+shared float partial[128];
+
+#ifdef PREDICTION
+// The sum of `value` over the workgroup, the same in every lane.
+float block_sum(float value) {
+    value = subgroupAdd(value);
+    if (subgroupElect()) partial[gl_SubgroupID] = value;
+    barrier();
+    float total = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) total += partial[i];
+    // The next sum writes the partials again.
+    barrier();
+    return total;
+}
+#endif
+
+void main() {
+    const uint sequence = gl_WorkGroupID.x, lane = gl_LocalInvocationID.x;
+#ifdef PREDICTION
+    // Kahan sums, as pooling's: a first row alone is its own mean.
+    const uint start = uint(cu[sequence]);
+    const uint end = MEAN ? uint(cu[sequence + 1]) : start + 1;
+    for (uint k = lane; k < WIDTH; k += 128) {
+        float sum = 0.0, carry = 0.0;
+        for (uint token = start; token < end; ++token) {
+            const float y = hidden[token * WIDTH + k] - carry;
+            const float t = sum + y;
+            carry = (t - sum) - y;
+            sum = t;
+        }
+        first_row[k] = sum / float(end - start);
+    }
+    barrier();
+    // A lane holds up to eight features of the widest model.
+    float features[8];
+    float sum = 0.0;
+    for (uint feature = lane, slot = 0; feature < WIDTH; feature += 128, ++slot) {
+        float acc = 0.0;
+        for (uint k = 0; k < WIDTH; ++k) acc += pooler_w[feature * WIDTH + k] * first_row[k];
+        features[slot] = SILU ? acc / (1.0 + exp(-acc)) : gelu(acc);
+        sum += features[slot];
+    }
+    const float mean = block_sum(sum) / float(WIDTH);
+    float squares = 0.0;
+    for (uint feature = lane, slot = 0; feature < WIDTH; feature += 128, ++slot) {
+        features[slot] -= mean;
+        squares += features[slot] * features[slot];
+    }
+    const float variance_eps = block_sum(squares) / float(WIDTH) + p.eps;
+    // inversesqrt(Inf) is zero and would hide an overflowing sum or variance as a finite score.
+    const float rstd = isnan(variance_eps) || isinf(variance_eps) ? uintBitsToFloat(0x7fc00000u)
+                       : inversesqrt(variance_eps);
+    float contribution = 0.0;
+    for (uint feature = lane, slot = 0; feature < WIDTH; feature += 128, ++slot) {
+        contribution += features[slot] * rstd * pooler_b[feature] * classifier_w[feature];
+    }
+#else
+    const uint first = uint(cu[sequence]) * WIDTH;
+    for (uint k = lane; k < WIDTH; k += 128) first_row[k] = hidden[first + k];
+    barrier();
+    float contribution = 0.0;
+    for (uint feature = lane; feature < WIDTH; feature += 128) {
+        float acc = pooler_b[feature];
+        for (uint k = 0; k < WIDTH; ++k) acc += pooler_w[feature * WIDTH + k] * first_row[k];
+        // Clamping or tanh would hide overflow as a finite saturated score.
+        if (isnan(acc) || isinf(acc))
+            contribution = uintBitsToFloat(0x7fc00000u);
+        else {
+            // tanh is +-1 in FP32 past 10; clamping keeps exp-based tanh from inf / inf.
+            contribution += tanh(clamp(acc, -10.0, 10.0)) * classifier_w[feature];
+        }
+    }
+#endif
+    const float total = subgroupAdd(contribution);
+    if (subgroupElect()) partial[gl_SubgroupID] = total;
+    barrier();
+    if (lane == 0) {
+        float score = classifier_b[0];
+        for (uint i = 0; i < gl_NumSubgroups; ++i) score += partial[i];
+        scores[sequence] = score;
+    }
+}

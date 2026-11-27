@@ -1,0 +1,39 @@
+#version 460
+// Kahan sums reduce FP32 accumulation error without FP64.
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+layout(local_size_x_id = 0) in;
+// Pools the [CLS] row alone; dividing its sum by one is exact.
+layout(constant_id = 1) const bool FIRST_ROW = false;
+
+const uint QUARTER = gl_WorkGroupSize.x;
+
+layout(std430, binding = 0) readonly buffer Hidden { vec4 hidden[]; };
+layout(std430, binding = 1) readonly buffer Cu { int cu[]; };
+layout(std430, binding = 2) writeonly buffer Out { vec4 result[]; };
+
+shared float partial[64];
+
+void main() {
+    const uint sequence = gl_WorkGroupID.x, column = gl_LocalInvocationID.x;
+    const uint first = uint(cu[sequence]);
+    const uint end = FIRST_ROW ? first + 1 : uint(cu[sequence + 1]);
+    vec4 sum = vec4(0.0), carry = vec4(0.0);
+    for (uint token = first; token < end; ++token) {
+        const vec4 y = hidden[token * QUARTER + column] - carry;
+        const vec4 t = sum + y;
+        carry = (t - sum) - y;
+        sum = t;
+    }
+    const vec4 mean = sum / float(end - first);
+    float squares = subgroupAdd(dot(mean, mean));
+    if (subgroupElect()) partial[gl_SubgroupID] = squares;
+    barrier();
+    float total = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; ++i) total += partial[i];
+    // An infinite norm would turn nonzero means into finite zero vectors.
+    if (isnan(total) || isinf(total))
+        result[sequence * QUARTER + column] = vec4(uintBitsToFloat(0x7fc00000u));
+    else
+        result[sequence * QUARTER + column] = mean / max(sqrt(total), 1e-12);
+}

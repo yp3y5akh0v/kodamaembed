@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "e5-sequence",
+      "checkpoint": "../../models/e5-large",
+      "fixture": "fixtures/e5-sequence/e5-sequence.json",
+      "cuda_onnx": "../e5-onnx/model-gpu-fp16-pooled.onnx",
+      "trt_onnx": "../e5-onnx/model-pooled.onnx",
+      "cpu_onnx": "../e5-onnx/model-pooled.onnx",
+      "export_receipt": "../e5-onnx/export.json",
+      "trt_cache": "cache/e5-sequence"
+    }
+  ]
+}

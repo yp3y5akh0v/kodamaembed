@@ -1,0 +1,17 @@
+[package]
+name = "kodamaembed-validate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Retrieval-quality evaluation for KodamaEmbed"
+publish = false
+
+[dependencies]
+clap.workspace = true
+kodamaembed.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
+serde_json.workspace = true

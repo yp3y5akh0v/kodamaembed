@@ -1,0 +1,26 @@
+[package]
+name = "kodamaembed-cuda"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "CUDA backend for KodamaEmbed: transformer encoders with kernels shipped as PTX"
+keywords = ["embeddings", "bert", "cuda", "gpu", "ptx"]
+categories = ["science", "hardware-support"]
+
+[dependencies]
+half.workspace = true
+kodamaembed-model.workspace = true
+
+# The CUDA driver is a dynamic library, which a wasm target cannot open.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+libloading.workspace = true
+
+[dev-dependencies]
+kodamaembed-cpu.workspace = true
+
+[[test]]
+name = "gpu"
+path = "tests/gpu/main.rs"

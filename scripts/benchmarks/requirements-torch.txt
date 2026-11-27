@@ -1,0 +1,6 @@
+# Install the CUDA wheel first using the official index documented in benchmarks.md.
+torch==2.14.1+cu130
+transformers==4.57.6
+tokenizers==0.22.2
+numpy==2.5.3
+safetensors==0.8.0

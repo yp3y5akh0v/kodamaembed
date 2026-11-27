@@ -1,0 +1,23 @@
+name: Model request
+description: Ask for a model KodamaEmbed does not load yet.
+title: "[Model] "
+labels: [enhancement]
+body:
+  - type: input
+    id: repository
+    attributes:
+      label: Hugging Face repository
+      placeholder: sentence-transformers/all-distilroberta-v1
+    validations:
+      required: true
+  - type: dropdown
+    id: task
+    attributes:
+      label: Task
+      options:
+        - Embedding
+        - Reranking
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this model
